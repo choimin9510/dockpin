@@ -22,9 +22,9 @@ open build/Dockpin.app --args --show
 
 ## How it works
 
-Layouts are saved per display configuration, identified by display UUID. Restoration waits for displays to settle and user input to stop, and waits up to 60 seconds for missing displays. Windows moved by the user are excluded from that restoration. If restoration fails, the existing baseline is preserved and automatic saving is suspended until recovery or a new baseline is chosen.
+Layouts are saved per display configuration, identified by display UUID. Restoration waits for displays to settle and user input to stop, and waits up to 60 seconds for missing displays. Windows moved by the user are excluded from that restoration. After restoration starts, windows are checked for at least 30 seconds and must stay correct for 3 seconds; retries continue for up to 60 seconds. A late application resize is corrected again. Failed windows and Dock settings retain their own targets while healthy windows continue saving. Unresolved targets retry after 30 seconds of tracking when input is idle, for up to 10 seconds per retry. System Events is started in the background before checking automation permission; an idle process exit is not treated as a permission denial.
 
-Dock movement assumes a bottom-positioned Dock and “Displays have separate Spaces.” It can fail if another display covers the target’s bottom edge or a menu is open. Dock control waits while DockLock is running.
+Dock movement assumes a bottom-positioned Dock and “Displays have separate Spaces.” It can fail if another display covers the target’s bottom edge or a menu is open. Dock control waits while DockLock is running. At another display’s bottom edge, Dockpin forwards mouse movements with corrected downward pressure, preserving sideways movement and upward escape instead of dropping events or warping the pointer.
 
 The app restores normal windows that permit movement through Accessibility, including the AgentBoard main panel. Full-screen, Split View, minimized and hidden windows, moving windows between desktops, and reopening closed apps or windows are not supported. Some apps may prevent restoration through their own minimum size or Accessibility behavior.
 

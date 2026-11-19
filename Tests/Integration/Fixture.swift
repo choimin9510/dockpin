@@ -2,6 +2,7 @@ import AppKit
 
 @main enum Fixture {
     static var windows: [NSWindow] = []
+    static var tokens: [NSObjectProtocol] = []
     static func main() {
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
@@ -16,6 +17,14 @@ import AppKit
             window.makeKeyAndOrderFront(nil)
             windows.append(window)
         }
+        tokens.append(DistributedNotificationCenter.default().addObserver(forName: .init("app.dockpin.fixture.rebound"), object: nil, queue: .main) { _ in
+            var frame = windows[0].frame
+            frame.size.width = max(200, frame.width - 100)
+            frame.size.height = max(200, frame.height - 60)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+                windows[0].setFrame(frame, display: true)
+            }
+        })
         app.run()
     }
 }

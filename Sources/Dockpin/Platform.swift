@@ -82,7 +82,8 @@ final class WindowAccess {
                 guard let windows = AX.value(root, kAXWindowsAttribute) as? [AXUIElement] else { result.unavailable.insert(app.pid); continue }
                 for element in windows where AX.eligible(element, bundleID: app.bundle) {
                     AXUIElementSetMessagingTimeout(element, 0.15)
-                    guard let frame = AX.rect(element), let screen = Geometry.display(for: frame, in: displays), AX.settable(element, kAXPositionAttribute) else { continue }
+                    guard let frame = AX.rect(element) else { result.unavailable.insert(app.pid); continue }
+                    guard let screen = Geometry.display(for: frame, in: displays), AX.settable(element, kAXPositionAttribute) else { continue }
                     let prior = self.previous.first { $0.snapshot.pid == app.pid && $0.snapshot.launchedAt == app.launched && CFEqual($0.element, element) }
                     let snapshot = WindowSnapshot(id: prior?.snapshot.id ?? UUID().uuidString, bundleID: app.bundle, pid: app.pid, launchedAt: app.launched,
                                                   identifier: AX.value(element, kAXIdentifierAttribute) as? String ?? "",
@@ -93,7 +94,11 @@ final class WindowAccess {
                 }
             }
             // Keep identities through temporary AX timeouts, but discard terminated processes.
-            self.previous = result.windows + self.previous.filter { old in result.unavailable.contains(old.snapshot.pid) && apps.contains(where: { $0.pid == old.snapshot.pid }) }
+            self.previous = result.windows + self.previous.filter { old in
+                result.unavailable.contains(old.snapshot.pid) &&
+                    apps.contains(where: { $0.pid == old.snapshot.pid && $0.launched == old.snapshot.launchedAt }) &&
+                    !result.windows.contains(where: { CFEqual($0.element, old.element) })
+            }
             continuation.resume(returning: result)
         } }
     }
@@ -102,6 +107,15 @@ final class WindowAccess {
             let e = live.element
             guard !permit.cancelled, AX.eligible(e, bundleID: live.snapshot.bundleID) else { continuation.resume(returning: false); return }
             if let current = AX.rect(e), Geometry.close(current, frame) { continuation.resume(returning: true); return }
+            let root = AXUIElementCreateApplication(live.snapshot.pid)
+            AXUIElementSetMessagingTimeout(root, 0.15)
+            let enhancedUI = "AXEnhancedUserInterface" as CFString
+            // AppKit animates AX writes in this mode; a following position write can undo the resize.
+            // Restore the original accessibility mode even if user input cancels the geometry write.
+            let wasEnhanced = AX.value(root, enhancedUI as String) as? Bool == true
+            if wasEnhanced { _ = AXUIElementSetAttributeValue(root, enhancedUI, kCFBooleanFalse) }
+            // cmux applies this attribute even when returning AXError.notImplemented.
+            defer { if wasEnhanced { _ = AXUIElementSetAttributeValue(root, enhancedUI, kCFBooleanTrue) } }
             var point = frame.origin, size = frame.size
             let p = AXValueCreate(.cgPoint, &point)!, s = AXValueCreate(.cgSize, &size)!
             // Some applications constrain size using the old screen until the first move.
@@ -193,9 +207,24 @@ final class InputActivity {
 final class DockAccess {
     private let queue = DispatchQueue(label: "app.dockpin.dock")
     var moving = false
-    var automationAllowed: Bool {
-        let target = NSAppleEventDescriptor(bundleIdentifier: "com.apple.systemevents")
-        return AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, false) == noErr
+    private(set) var permissionStatus: OSStatus = OSStatus(procNotFound)
+    var automationAllowed: Bool { permissionStatus == noErr }
+    @MainActor func checkAutomation(request: Bool = false) async -> Bool {
+        // System Events exits when idle. -600 means it is not running, not denied permission.
+        if NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systemevents").isEmpty {
+            guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.systemevents") else {
+                permissionStatus = OSStatus(procNotFound); return false
+            }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = false
+            do { _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration) }
+            catch { permissionStatus = OSStatus(procNotFound); return false }
+        }
+        permissionStatus = await withCheckedContinuation { continuation in queue.async {
+            let target = NSAppleEventDescriptor(bundleIdentifier: "com.apple.systemevents")
+            continuation.resume(returning: AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, request))
+        } }
+        return automationAllowed
     }
     func currentDisplay(_ displays: [DisplaySnapshot]) -> String? {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return nil }
@@ -205,20 +234,20 @@ final class DockAccess {
               let list = children.first(where: { AX.value($0, kAXRoleAttribute) as? String == kAXListRole }), let frame = AX.rect(list) else { return nil }
         return Geometry.display(for: frame, in: displays)?.id
     }
-    private func script(_ source: String) async -> NSAppleEventDescriptor? {
+    @MainActor private func script(_ source: String) async -> NSAppleEventDescriptor? {
         await withCheckedContinuation { continuation in queue.async {
             var error: NSDictionary?
             let result = NSAppleScript(source: source)?.executeAndReturnError(&error)
             continuation.resume(returning: error == nil ? result : nil)
         } }
     }
-    func settings(displayID: String, request: Bool = false) async -> DockSnapshot? {
-        guard request || automationAllowed else { return nil }
+    @MainActor func settings(displayID: String, request: Bool = false) async -> DockSnapshot? {
+        guard await checkAutomation(request: request) else { return nil }
         guard let result = await script("tell application \"System Events\" to tell dock preferences to return {dock size, magnification, magnification size}") else { return nil }
         guard let size = result.atIndex(1)?.doubleValue, let magnify = result.atIndex(2)?.booleanValue, let maxSize = result.atIndex(3)?.doubleValue else { return nil }
         return DockSnapshot(displayID: displayID, size: size, magnification: magnify, magnificationSize: maxSize)
     }
-    func applySettings(_ snapshot: DockSnapshot, cancelled: () -> Bool = { false }) async -> Bool {
+    @MainActor func applySettings(_ snapshot: DockSnapshot, cancelled: () -> Bool = { false }) async -> Bool {
         guard snapshot.size != nil else { return true }
         guard let current = await settings(displayID: snapshot.displayID) else { return false }
         guard !cancelled() else { return false }

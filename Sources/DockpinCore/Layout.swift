@@ -114,8 +114,35 @@ public enum WindowMatcher {
     }
 }
 
+public struct LayoutProtection {
+    public var baseline: LayoutSnapshot
+    public var windowIDs: Set<String>
+    public var dock: Bool
+    public init(baseline: LayoutSnapshot, windowIDs: Set<String>, dock: Bool) {
+        self.baseline = baseline; self.windowIDs = windowIDs; self.dock = dock
+    }
+    public var isEmpty: Bool { windowIDs.isEmpty && !dock }
+    public func merging(_ fresh: LayoutSnapshot) -> LayoutSnapshot {
+        guard fresh.configurationID == baseline.configurationID else { return fresh }
+        var merged = fresh
+        for saved in baseline.windows where windowIDs.contains(saved.id) {
+            if let match = WindowMatcher.match(saved, current: fresh.windows, original: baseline.windows),
+               let index = merged.windows.firstIndex(where: { $0.id == match.id }),
+               let oldScreen = baseline.displays.first(where: { $0.id == saved.displayID }),
+               let screen = fresh.displays.first(where: { $0.id == saved.displayID }) {
+                // Keep current identity and title while protecting only the failed geometry.
+                merged.windows[index].displayID = saved.displayID
+                merged.windows[index].frame = Geometry.target(saved, savedDisplay: oldScreen, current: screen)
+                    .offsetBy(dx: -screen.bounds.minX, dy: -screen.bounds.minY)
+            } else { merged.windows.append(saved) }
+        }
+        if dock { merged.dock = baseline.dock }
+        return merged
+    }
+}
+
 public struct RecoveryGate {
-    public enum Phase: String { case tracking, sleeping, settling, restoring, protected }
+    public enum Phase: String { case tracking, sleeping, settling, restoring }
     public private(set) var phase: Phase = .tracking
     public private(set) var generation = 0
     public private(set) var changedAt = Date.distantPast
@@ -126,12 +153,12 @@ public struct RecoveryGate {
     public mutating func wake(now: Date) { generation += 1; phase = .settling; changedAt = now; deadline = now.addingTimeInterval(60) }
     public mutating func displayChanged(now: Date) {
         if phase == .sleeping { generation += 1; return }
-        if phase == .tracking || phase == .protected { deadline = now.addingTimeInterval(60) }
+        if phase == .tracking { deadline = now.addingTimeInterval(60) }
         generation += 1; phase = .settling; changedAt = now
     }
     public func ready(now: Date) -> Bool { phase == .settling && now.timeIntervalSince(changedAt) >= 3 }
     public mutating func begin() { phase = .restoring }
-    public mutating func finish(success: Bool) { phase = success ? .tracking : .protected }
+    public mutating func finish() { phase = .tracking }
     public mutating func remember() { generation += 1; phase = .tracking }
 }
 

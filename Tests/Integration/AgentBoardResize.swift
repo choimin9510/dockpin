@@ -35,7 +35,7 @@ import DockpinCore
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 let protected = (try? LayoutRepository(directory: directory).load().first) == before
                 NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
-                let deadline = Date().addingTimeInterval(20)
+                let deadline = Date().addingTimeInterval(50)
                 while !recovery.status.contains("복원 완료") && Date() < deadline { try? await Task.sleep(nanoseconds: 250_000_000) }
                 let restored = AX.rect(live.element).map { Geometry.close($0, original) } ?? false
                 recovery.stop()

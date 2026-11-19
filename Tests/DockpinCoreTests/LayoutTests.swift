@@ -24,7 +24,9 @@ func XCTAssertNil<T>(_ value: T?, file: StaticString = #file, line: UInt = #line
         suite.testStableUniqueIdentifierSurvivesTitleChange()
         try suite.testRepositoryRoundTripAndMalformedFileIsolation()
         suite.testOnlyAgentBoardMainPanelIsIncluded()
-        print("PASS: 10 recovery, geometry, identity and persistence scenarios")
+        suite.testFailureProtectionKeepsHealthyWindowsFresh()
+        suite.testProtectionDoesNotLeakAcrossDisplaysOrAmbiguousWindows()
+        print("PASS: 12 recovery, geometry, identity and persistence scenarios")
     }
     func screen(_ id: String, _ x: Double = 0, _ y: Double = 0, _ width: Double = 2560, _ height: Double = 1440) -> DisplaySnapshot {
         let r = CGRect(x: x, y: y, width: width, height: height)
@@ -53,7 +55,7 @@ func XCTAssertNil<T>(_ value: T?, file: StaticString = #file, line: UInt = #line
         XCTAssertTrue(gate.ready(now: now.addingTimeInterval(5)))
         XCTAssertEqual(gate.deadline, now.addingTimeInterval(60))
         gate.begin(); XCTAssertFalse(gate.canCapture)
-        gate.finish(success: false); XCTAssertFalse(gate.canCapture)
+        gate.finish(); XCTAssertTrue(gate.canCapture)
         gate.remember(); XCTAssertTrue(gate.canCapture)
     }
     func testIdenticalDisplayNamesDoNotConfuseIdentityOrOrder() {
@@ -101,5 +103,34 @@ func XCTAssertNil<T>(_ value: T?, file: StaticString = #file, line: UInt = #line
         XCTAssertEqual(try repo.load(), [snapshot])
         var newer = snapshot; newer.windows = []
         try repo.save(newer); XCTAssertEqual(try repo.load(), [newer])
+    }
+    func testFailureProtectionKeepsHealthyWindowsFresh() {
+        var a = window("a"), b = window("b")
+        a.identifier = "unique-a"; b.identifier = "unique-b"
+        let baseline = LayoutSnapshot(displays: [screen("a")], windows: [a,b], dock: DockSnapshot(displayID: "a", size: 0.7))
+        var changedA = a, changedB = b
+        changedA.id = "new-a"; changedA.frame.size.width = 400
+        changedB.frame.size.width = 500
+        let fresh = LayoutSnapshot(displays: [screen("a")], windows: [changedA,changedB], dock: DockSnapshot(displayID: "a", size: 0.1))
+        let result = LayoutProtection(baseline: baseline, windowIDs: ["a"], dock: true).merging(fresh)
+        XCTAssertEqual(result.windows.count, 2)
+        XCTAssertEqual(result.windows[0].id, "new-a")
+        XCTAssertEqual(result.windows[0].frame, a.frame)
+        XCTAssertEqual(result.windows[1], changedB)
+        XCTAssertEqual(result.dock, baseline.dock)
+        let dockOnly = LayoutProtection(baseline: baseline, windowIDs: [], dock: true).merging(fresh)
+        XCTAssertEqual(dockOnly.windows, fresh.windows)
+    }
+    func testProtectionDoesNotLeakAcrossDisplaysOrAmbiguousWindows() {
+        let a = window("a"), b = window("b")
+        let baseline = LayoutSnapshot(displays: [screen("a")], windows: [a,b], dock: nil)
+        let protection = LayoutProtection(baseline: baseline, windowIDs: ["a"], dock: false)
+        let other = LayoutSnapshot(displays: [screen("b")], windows: [window("other", "b")], dock: nil)
+        XCTAssertEqual(protection.merging(other), other)
+        var unknown = window("unknown"); unknown.frame.size.width = 400
+        let fresh = LayoutSnapshot(displays: baseline.displays, windows: [unknown], dock: nil)
+        let result = protection.merging(fresh)
+        XCTAssertEqual(result.windows.first, unknown)
+        XCTAssertEqual(result.windows.last, a)
     }
 }

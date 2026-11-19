@@ -3,12 +3,6 @@ import SwiftUI
 import ServiceManagement
 import DockpinCore
 
-struct Display: Identifiable {
-    let id: String
-    let name: String
-    let bounds: CGRect
-}
-
 final class PinStore: ObservableObject {
     let recovery = Recovery()
     @Published var displays: [Display] = []
@@ -82,12 +76,8 @@ final class PinStore: ObservableObject {
                 return Unmanaged.passUnretained(event)
             }
             store.received += 1
-            // Drop the edge event so Dock cannot consume its original movement delta.
-            if !store.recovery.dock.moving, event.getIntegerValueField(.eventSourceUserData) != InputActivity.marker,
-               !event.flags.contains(.maskAlternate), let point = Boundary.clamp(event.location, displays: store.displays, allowed: store.effective) {
+            if Boundary.adjust(event, displays: store.displays, allowed: store.effective, bypass: store.recovery.dock.moving) {
                 store.blocked += 1
-                CGWarpMouseCursorPosition(point)
-                return nil
             }
             return Unmanaged.passUnretained(event)
         }, userInfo: Unmanaged.passUnretained(self).toOpaque())
@@ -102,17 +92,6 @@ final class PinStore: ObservableObject {
         if let tap = tap { CGEvent.tapEnable(tap: tap, enable: false); CFMachPortInvalidate(tap) }
         if let source = source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
         tap = nil; source = nil
-    }
-}
-
-enum Boundary {
-    static func clamp(_ point: CGPoint, displays: [Display], allowed: String) -> CGPoint? {
-        guard let screen = displays.first(where: { $0.bounds.contains(point) }), screen.id != allowed,
-              point.y >= screen.bounds.maxY - 3 else { return nil }
-        // Preserve crossings to a display physically below this edge.
-        let below = CGPoint(x: point.x, y: screen.bounds.maxY + 1)
-        guard !displays.contains(where: { $0.bounds.contains(below) }) else { return nil }
-        return CGPoint(x: point.x, y: screen.bounds.maxY - 4)
     }
 }
 

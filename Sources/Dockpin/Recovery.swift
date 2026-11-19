@@ -1,6 +1,12 @@
 import AppKit
 import DockpinCore
 
+struct RecoveryTiming {
+    var observation: TimeInterval = 30
+    var timeout: TimeInterval = 60
+    var stable: TimeInterval = 3
+}
+
 final class Recovery: ObservableObject {
     @Published var enabled = UserDefaults.standard.object(forKey: "restoreEnabled") as? Bool ?? true
     @Published var status = "배치를 확인하는 중"
@@ -18,6 +24,10 @@ final class Recovery: ObservableObject {
     private let diagnosticsURL: URL
     private var currentWrite: WritePermit?
     private var profiles: [String: LayoutSnapshot] = [:]
+    private var protections: [String: LayoutProtection] = [:]
+    private var lastRecovery: [String: Any] = [:]
+    private var protectionRetryAt = Date.distantFuture
+    private let timing: RecoveryTiming
     private var pending: LayoutSnapshot?
     private var gate = RecoveryGate()
     private var timer: Timer?
@@ -37,11 +47,12 @@ final class Recovery: ObservableObject {
     var closePanel: () -> Void = {}
     var canRemember: Bool { !busy && gate.phase != .sleeping && gate.phase != .settling }
 
-    init(directory: URL? = nil, applications: @escaping () -> [AppIdentity] = AppIdentity.current, isTrusted: @escaping () -> Bool = AXIsProcessTrusted) {
+    init(directory: URL? = nil, applications: @escaping () -> [AppIdentity] = AppIdentity.current, isTrusted: @escaping () -> Bool = AXIsProcessTrusted, timing: RecoveryTiming = RecoveryTiming()) {
         let folder = directory ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Dockpin/Layouts", isDirectory: true)
         repository = LayoutRepository(directory: folder)
         self.applications = applications
         self.isTrusted = isTrusted
+        self.timing = timing
         diagnosticsURL = directory?.appendingPathComponent("recovery-status.txt") ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Dockpin-recovery.json")
         do { for snapshot in try repository.load() { profiles[snapshot.configurationID] = snapshot } }
         catch { status = "저장된 배치를 읽지 못했어요: \(error.localizedDescription)" }
@@ -58,7 +69,20 @@ final class Recovery: ObservableObject {
                    let window = self.live.first(where: { CFEqual($0.element, element) }) {
                     self.changedByUser.insert(window.snapshot.id)
                 }
-            } else if self.gate.canCapture { self.requestCapture() }
+            } else if self.gate.canCapture {
+                if Date().timeIntervalSince(self.input.lastDrag) < 1,
+                   let window = self.live.first(where: { CFEqual($0.element, element) }) {
+                    for key in Array(self.protections.keys) {
+                        guard let protection = self.protections[key] else { continue }
+                        for saved in protection.baseline.windows where protection.windowIDs.contains(saved.id) {
+                            if WindowMatcher.match(saved, current: self.live.map(\.snapshot), original: protection.baseline.windows)?.id == window.snapshot.id {
+                                self.protections[key]?.windowIDs.remove(saved.id)
+                            }
+                        }
+                    }
+                }
+                self.requestCapture()
+            }
         }
         observe(NSWorkspace.shared.notificationCenter, NSWorkspace.willSleepNotification) { $0.sleep() }
         observe(NSWorkspace.shared.notificationCenter, NSWorkspace.screensDidSleepNotification) { $0.sleep() }
@@ -75,6 +99,7 @@ final class Recovery: ObservableObject {
         if rememberCurrent {
             pending = nil; gate.remember(); requestCapture(force: true)
         } else if enabled { wake() } else { status = "자동 복원 꺼짐" }
+        writeDiagnostics()
     }
     private static let displayCallback: CGDisplayReconfigurationCallBack = { _, _, context in
         guard let context = context else { return }
@@ -93,17 +118,19 @@ final class Recovery: ObservableObject {
     }
     private func sleep() {
         guard enabled else { return }
-        freeze(); gate.sleep(); status = "잠자기 전 배치를 보호하는 중"
+        freeze(); gate.sleep(); status = "잠자기 전 배치를 보호하는 중"; writeDiagnostics()
     }
     func wake() {
         guard enabled else { return }
         freeze(); gate.wake(now: Date()); restoreStarted = Date(); changedByUser.removeAll()
         status = "화면이 다시 연결되기를 기다리는 중"
+        writeDiagnostics()
     }
     private func displayChanged() {
         guard enabled else { return }
         freeze(); gate.displayChanged(now: Date())
         if gate.phase != .sleeping { status = "화면 구성이 안정되기를 기다리는 중" }
+        writeDiagnostics()
     }
     func setEnabled(_ value: Bool) {
         enabled = value; UserDefaults.standard.set(value, forKey: "restoreEnabled")
@@ -119,7 +146,8 @@ final class Recovery: ObservableObject {
     }
     func rememberNow() {
         guard canRemember else { return }
-        freeze(); pending = nil; gate.remember(); requestCapture(force: true)
+        freeze(); pending = nil; protections.removeValue(forKey: Geometry.configurationID(Screens.current()))
+        gate.remember(); requestCapture(force: true)
     }
     func requestAutomation() {
         closePanel()
@@ -127,13 +155,21 @@ final class Recovery: ObservableObject {
             let generation = gate.generation
             let setting = await dock.settings(displayID: selectedDisplay(), request: true)
             automationAllowed = dock.automationAllowed
-            if generation == gate.generation, gate.canCapture { dockSettings = setting; settingsReadAt = Date(); requestCapture(force: true) }
+            if generation == gate.generation, gate.canCapture {
+                dockSettings = setting; settingsReadAt = Date()
+                if automationAllowed, protections[Geometry.configurationID(Screens.current())]?.dock == true { restoreNow() }
+                else { requestCapture(force: true) }
+            }
             if !automationAllowed { status = "시스템 설정 → 개인정보 보호 및 보안 → 자동화에서 System Events를 허용해 주세요" }
         }
     }
     private func tick() {
         guard enabled || pending != nil else { return }
-        guard isTrusted() else { status = "창 복원에 손쉬운 사용 권한이 필요해요"; return }
+        guard isTrusted() else {
+            let message = "창 복원에 손쉬운 사용 권한이 필요해요"
+            if status != message { status = message; writeDiagnostics() }
+            return
+        }
         input.start()
         guard gate.phase != .sleeping else { return }
         let screens = Screens.current()
@@ -154,9 +190,20 @@ final class Recovery: ObservableObject {
                 let generation = gate.generation
                 restoreTask = Task { @MainActor in await self.restore(target, generation: generation) }
             } else {
-                gate.finish(success: true); lastDisplayState = screens; requestCapture(force: true)
+                gate.finish(); lastDisplayState = screens; requestCapture(force: true)
             }
-        } else if gate.canCapture && !busy && Date().timeIntervalSince(lastScan) >= 5 { requestCapture() }
+        } else if gate.canCapture && !busy {
+            let key = Geometry.configurationID(screens)
+            if Date() >= protectionRetryAt, input.idle, let protection = protections[key], !protection.isEmpty {
+                var target = protection.baseline
+                if !protection.dock { target.dock = nil }
+                freeze(); gate.remember(); gate.begin(); busy = true
+                restoreStarted = Date(); changedByUser.removeAll()
+                let generation = gate.generation
+                let retryTarget = target
+                restoreTask = Task { @MainActor in await self.restore(retryTarget, generation: generation, retry: true, windowIDs: protection.windowIDs) }
+            } else if Date().timeIntervalSince(lastScan) >= 5 { requestCapture() }
+        }
     }
     private func requestCapture(force: Bool = false) {
         guard gate.canCapture, !busy, (enabled || force) else { return }
@@ -178,30 +225,57 @@ final class Recovery: ObservableObject {
         live = result.windows; observations.update(live, apps: apps)
         let key = Geometry.configurationID(screens)
         var windows = live.map(\.snapshot)
-        windows += (profiles[key]?.windows ?? []).filter { old in result.unavailable.contains(old.pid) && apps.contains(where: { $0.pid == old.pid && $0.launched == old.launchedAt }) }
-        automationAllowed = dock.automationAllowed
-        let dockID = dockEnabled() ? selectedDisplay() : dock.currentDisplay(screens)
-        if automationAllowed, Date().timeIntervalSince(settingsReadAt) >= 5, let id = dockID {
-            dockSettings = await dock.settings(displayID: id); settingsReadAt = Date()
+        windows += (profiles[key]?.windows ?? []).filter { old in
+            result.unavailable.contains(old.pid) && apps.contains(where: { $0.pid == old.pid && $0.launched == old.launchedAt }) &&
+                WindowMatcher.match(old, current: windows, original: profiles[key]?.windows ?? []) == nil
         }
+        let dockID = dockEnabled() ? selectedDisplay() : dock.currentDisplay(screens)
+        if Date().timeIntervalSince(settingsReadAt) >= 5, let id = dockID {
+            if let settings = await dock.settings(displayID: id) { dockSettings = settings }
+            settingsReadAt = Date()
+        }
+        automationAllowed = dock.automationAllowed
         guard !Task.isCancelled, generation == gate.generation, gate.canCapture, screens == Screens.current() else { return }
         var dockSnapshot = dockID.map { DockSnapshot(displayID: $0) }
         if let setting = dockSettings, let id = dockID { dockSnapshot = setting; dockSnapshot?.displayID = id }
-        let snapshot = LayoutSnapshot(displays: screens, windows: windows, dock: dockSnapshot)
+        if dockSnapshot?.size == nil, let savedDock = profiles[key]?.dock {
+            dockSnapshot = savedDock
+            if let id = dockID { dockSnapshot?.displayID = id }
+        }
+        if let protection = protections[key] {
+            for saved in protection.baseline.windows where protection.windowIDs.contains(saved.id) {
+                let active = apps.contains { $0.pid == saved.pid && $0.launched == saved.launchedAt }
+                let match = WindowMatcher.match(saved, current: live.map(\.snapshot), original: protection.baseline.windows)
+                if !active || (match == nil && !result.unavailable.contains(saved.pid) && !apps.contains(where: { $0.pid == saved.pid && $0.hidden })) {
+                    protections[key]?.windowIDs.remove(saved.id)
+                }
+            }
+        }
+        let fresh = LayoutSnapshot(displays: screens, windows: windows, dock: dockSnapshot)
+        let snapshot = protections[key]?.merging(fresh) ?? fresh
         do {
             if let prior = profiles[key], prior.displays == snapshot.displays && prior.windows == snapshot.windows && prior.dock == snapshot.dock {
                 savedAt = prior.savedAt
             } else {
                 try repository.save(snapshot); profiles[key] = snapshot; savedAt = snapshot.savedAt
             }
-            pending = nil; lastDisplayState = screens; windowCount = windows.count
+            pending = nil; lastDisplayState = screens; windowCount = snapshot.windows.count
             status = "\(windows.count)개 창의 정상 배치를 기억하고 있어요"
+            if let protection = protections[key], !protection.isEmpty {
+                status += " · 복원 대기: 창 \(protection.windowIDs.count)개" + (protection.dock ? ", Dock" : "")
+            }
         } catch { status = "배치 저장 실패: \(error.localizedDescription)" }
         writeDiagnostics()
     }
-    private func restore(_ snapshot: LayoutSnapshot, generation: Int) async {
+    private func restore(_ snapshot: LayoutSnapshot, generation: Int, retry: Bool = false, windowIDs: Set<String>? = nil) async {
         func cancelled() -> Bool { Task.isCancelled || gate.generation != generation || gate.phase != .restoring }
         closePanel()
+        let started = Date()
+        let observation = retry ? min(3, timing.observation) : timing.observation
+        let deadline = started.addingTimeInterval(retry ? min(10, timing.timeout) : timing.timeout)
+        lastRecovery = ["startedAt": started.description, "retry": retry, "windows": [[String: Any]]()]
+        status = "저장된 배치로 복원하고 앱의 크기 변경을 확인하는 중"
+        writeDiagnostics()
         var dockOK = true
         var dockReason = ""
         if let savedDock = snapshot.dock {
@@ -226,43 +300,86 @@ final class Recovery: ObservableObject {
         }
         guard !cancelled() else { return }
         var restored: Set<String> = [], skipped: Set<String> = [], failed: Set<String> = []
-        for attempt in 0..<3 {
+        var attempts: [String: Int] = [:]
+        var stableSince = Date()
+        repeat {
             guard !cancelled() else { return }
             let screens = Screens.current(), apps = applications()
             let result = await access.scan(apps: apps, displays: screens)
             guard !cancelled() else { return }
             live = result.windows; observations.update(live, apps: apps)
-            for saved in snapshot.windows where !restored.contains(saved.id) && !skipped.contains(saved.id) {
+            restored.removeAll(); skipped.removeAll(); failed.removeAll()
+            var details: [[String: Any]] = []
+            for saved in snapshot.windows where windowIDs == nil || windowIDs!.contains(saved.id) {
                 guard !cancelled() else { return }
-                guard let currentScreen = screens.first(where: { $0.id == saved.displayID }), let oldScreen = snapshot.displays.first(where: { $0.id == saved.displayID }) else { failed.insert(saved.id); continue }
-                guard let match = WindowMatcher.match(saved, current: live.map(\.snapshot), original: snapshot.windows), let current = live.first(where: { $0.snapshot.id == match.id }) else {
-                    if result.unavailable.contains(saved.pid) { failed.insert(saved.id) } else { skipped.insert(saved.id); failed.remove(saved.id) }
+                var detail: [String: Any] = ["id": saved.id, "bundleID": saved.bundleID, "attempts": attempts[saved.id, default: 0]]
+                defer { details.append(detail) }
+                guard let currentScreen = screens.first(where: { $0.id == saved.displayID }),
+                      let oldScreen = snapshot.displays.first(where: { $0.id == saved.displayID }) else {
+                    failed.insert(saved.id); detail["result"] = "displayMissing"; continue
+                }
+                let frame = Geometry.target(saved, savedDisplay: oldScreen, current: currentScreen)
+                detail["target"] = rectDescription(frame)
+                guard let match = WindowMatcher.match(saved, current: live.map(\.snapshot), original: snapshot.windows),
+                      let current = live.first(where: { $0.snapshot.id == match.id }) else {
+                    if result.unavailable.contains(saved.pid) {
+                        failed.insert(saved.id); detail["result"] = "AXUnavailable"
+                    } else { skipped.insert(saved.id); detail["result"] = "closedHiddenOrUnmatched" }
                     continue
                 }
-                if changedByUser.contains(match.id) { skipped.insert(saved.id); failed.remove(saved.id); continue }
-                guard input.idle else { failed.insert(saved.id); continue }
-                let frame = Geometry.target(saved, savedDisplay: oldScreen, current: currentScreen)
+                detail["actual"] = rectDescription(current.globalFrame)
+                if changedByUser.contains(match.id) {
+                    skipped.insert(saved.id); detail["result"] = "userMoved"; continue
+                }
+                if Geometry.close(current.globalFrame, frame) {
+                    restored.insert(saved.id); detail["result"] = "verified"; continue
+                }
+                // Recheck every window, including ones that previously accepted an AX write.
+                failed.insert(saved.id)
+                guard input.idle else { detail["result"] = "waitingForInput"; continue }
                 let permit = WritePermit(); currentWrite = permit
-                if await access.move(current, to: frame, permit: permit) { restored.insert(saved.id); failed.remove(saved.id) } else { failed.insert(saved.id) }
+                attempts[saved.id, default: 0] += 1
+                let accepted = await access.move(current, to: frame, permit: permit)
+                detail["attempts"] = attempts[saved.id]
+                detail["result"] = accepted ? "writeAcceptedAwaitingVerification" : "writeUnconfirmed"
                 currentWrite = nil
             }
-            if failed.isEmpty { break }
-            if attempt < 2 { try? await Task.sleep(nanoseconds: 1_000_000_000) }
-        }
+            if !failed.isEmpty { stableSince = Date() }
+            lastRecovery["windows"] = details
+            lastRecovery["dockResult"] = dockOK ? "verified" : dockReason
+            lastRecovery["checkedAt"] = Date().description
+            automationAllowed = dock.automationAllowed
+            writeDiagnostics()
+            if Date().timeIntervalSince(started) >= observation && failed.isEmpty && Date().timeIntervalSince(stableSince) >= timing.stable { break }
+            if Date() >= deadline { break }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        } while !cancelled()
         guard !cancelled() else { return }
         let success = failed.isEmpty && dockOK
-        busy = false; gate.finish(success: success); lastDisplayState = Screens.current()
-        pending = success ? nil : snapshot
+        let key = snapshot.configurationID
+        protections[key] = LayoutProtection(baseline: snapshot, windowIDs: failed, dock: !dockOK)
+        protectionRetryAt = Date().addingTimeInterval(30)
+        // Failed targets are merged individually. Healthy windows must keep being saved.
+        busy = false; gate.finish(); lastDisplayState = Screens.current(); pending = nil
         savedAt = snapshot.savedAt; windowCount = snapshot.windows.count
-        status = success ? "\(restored.count)개 창 복원 완료" : "일부 복원 실패 · 기존 배치를 보호하고 있어요"
+        status = success ? "\(restored.count)개 창 복원 완료" : "정상 창 저장 계속 · 실패한 배치만 보호하고 재시도해요"
         if !failed.isEmpty { status += " · 창 \(failed.count)개" }
         if !dockOK { status += " · " + (dockReason.isEmpty ? "Dock 이동 실패" : dockReason) }
         if !skipped.isEmpty { status += " · 닫힘·변경·식별 불가 \(skipped.count)개 제외" }
-        // Give application resize animations time to finish before accepting a new baseline.
+        lastRecovery["finishedAt"] = Date().description
+        lastRecovery["success"] = success
         lastScan = Date(); writeDiagnostics()
     }
+    private func rectDescription(_ frame: CGRect) -> [String: Double] {
+        ["x": frame.minX, "y": frame.minY, "width": frame.width, "height": frame.height]
+    }
     private func writeDiagnostics() {
-        let payload: [String: Any] = ["enabled": enabled, "phase": gate.phase.rawValue, "windowCount": windowCount, "status": status, "automationAllowed": automationAllowed, "savedAt": savedAt?.description ?? ""]
+        let key = Geometry.configurationID(Screens.current())
+        let payload: [String: Any] = ["updatedAt": Date().description, "enabled": enabled, "phase": gate.phase.rawValue,
+                                     "windowCount": windowCount, "status": status, "automationAllowed": automationAllowed,
+                                     "automationStatus": dock.permissionStatus, "savedAt": savedAt?.description ?? "",
+                                     "protectedWindowIDs": Array(protections[key]?.windowIDs ?? []).sorted(),
+                                     "protectedDock": protections[key]?.dock ?? false, "lastRecovery": lastRecovery]
         if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: diagnosticsURL, options: .atomic) }
     }
     func stop() {
