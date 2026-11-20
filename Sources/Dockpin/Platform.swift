@@ -173,11 +173,30 @@ final class InputActivity {
     static let marker: Int64 = 0x444F434B50494E
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
-    private(set) var lastInput = Date.distantPast
-    private(set) var lastDrag = Date.distantPast
-    var onInput: (() -> Void)?
+    private var readiness = InputReadiness()
+    var lastInput: Date { readiness.lastInput }
+    var lastDrag: Date { readiness.lastDrag }
+    var onWindowInteraction: (() -> Void)?
     var available: Bool { tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false }
-    var idle: Bool { available && Date().timeIntervalSince(lastInput) >= 2 && !CGEventSource.buttonState(.combinedSessionState, button: .left) && !CGEventSource.buttonState(.combinedSessionState, button: .right) }
+    private var buttonsDown: Bool {
+        [CGMouseButton.left, .right, .center].contains { CGEventSource.buttonState(.combinedSessionState, button: $0) }
+    }
+    var idle: Bool { readiness.dockReady(at: Date(), available: available, buttonsDown: buttonsDown) }
+    var windowsReady: Bool { readiness.windowsReady(at: Date(), available: available, buttonsDown: buttonsDown) }
+    func record(_ type: CGEventType, event: CGEvent) {
+        guard event.getIntegerValueField(.eventSourceUserData) != Self.marker else { return }
+        let kind: InputReadiness.Kind
+        switch type {
+        case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
+            kind = .pointerInteraction
+        case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            kind = .dragging
+        case .mouseMoved: kind = .movement
+        case .scrollWheel: kind = .scrolling
+        default: kind = .typing
+        }
+        if readiness.record(kind, at: Date()) { onWindowInteraction?() }
+    }
     func start() {
         guard tap == nil else { return }
         let types: [CGEventType] = [.mouseMoved, .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .keyDown, .keyUp, .flagsChanged, .scrollWheel]
@@ -185,14 +204,10 @@ final class InputActivity {
             guard let context = context else { return Unmanaged.passUnretained(event) }
             let owner = Unmanaged<InputActivity>.fromOpaque(context).takeUnretainedValue()
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                owner.lastInput = Date()
-                owner.onInput?()
+                owner.readiness.record(.pointerInteraction, at: Date())
+                owner.onWindowInteraction?()
                 if let tap = owner.tap { CGEvent.tapEnable(tap: tap, enable: true) }
-            } else if event.getIntegerValueField(.eventSourceUserData) != InputActivity.marker {
-                owner.lastInput = Date()
-                owner.onInput?()
-                if type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged { owner.lastDrag = Date() }
-            }
+            } else { owner.record(type, event: event) }
             return Unmanaged.passUnretained(event)
         }, userInfo: Unmanaged.passUnretained(self).toOpaque())
         if let tap = tap {
@@ -250,8 +265,8 @@ final class DockAccess {
     @MainActor func applySettings(_ snapshot: DockSnapshot, cancelled: () -> Bool = { false }) async -> Bool {
         guard snapshot.size != nil else { return true }
         guard let current = await settings(displayID: snapshot.displayID) else { return false }
-        guard !cancelled() else { return false }
         if sameSettings(current, snapshot) { return true }
+        guard !cancelled() else { return false }
         var commands: [String] = []
         if let size = snapshot.size { commands.append("set dock size to \(min(1, max(0, size)))") }
         if let mag = snapshot.magnification { commands.append("set magnification to \(mag ? "true" : "false")") }

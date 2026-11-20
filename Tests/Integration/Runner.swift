@@ -6,7 +6,13 @@ import DockpinCore
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         Task { @MainActor in
-            do { try await run(); print("PASS: live window restoration, frozen baseline, cancellation, Dock relocation and pointer return"); exit(0) }
+            do {
+                try await run()
+                print(CommandLine.arguments.contains("--windows-only")
+                      ? "PASS: live window restoration during input, frozen baseline, cancellation and Dock failure isolation"
+                      : "PASS: live window restoration, frozen baseline, cancellation, Dock relocation and pointer return")
+                exit(0)
+            }
             catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
         }
         app.run()
@@ -22,14 +28,16 @@ import DockpinCore
     }
     @MainActor static func run() async throws {
         try require(AXIsProcessTrusted(), "Accessibility permission is required for integration checks")
-        let automation = DockAccess()
-        for application in NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systemevents") { application.terminate() }
-        try await until("System Events did not exit", seconds: 5) {
-            NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systemevents").isEmpty
+        if !CommandLine.arguments.contains("--windows-only") {
+            let automation = DockAccess()
+            for application in NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systemevents") { application.terminate() }
+            try await until("System Events did not exit", seconds: 5) {
+                NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.systemevents").isEmpty
+            }
+            let settings = await automation.settings(displayID: Screens.current()[0].id)
+            try require(settings?.size != nil && automation.automationAllowed, "System Events relaunch did not preserve granted automation permission: \(automation.permissionStatus)")
+            print("PASS: exited System Events is relaunched and granted automation remains usable")
         }
-        let settings = await automation.settings(displayID: Screens.current()[0].id)
-        try require(settings?.size != nil && automation.automationAllowed, "System Events relaunch did not preserve granted automation permission: \(automation.permissionStatus)")
-        print("PASS: exited System Events is relaunched and granted automation remains usable")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("DockpinChecks-" + UUID().uuidString)
         let fixtureURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/fixtures/DockpinFixture.app")
         let fixture = try await NSWorkspace.shared.openApplication(at: fixtureURL, configuration: NSWorkspace.OpenConfiguration())
@@ -51,11 +59,21 @@ import DockpinCore
         }
         try await Task.sleep(nanoseconds: 1_000_000_000)
         try require(try repository.load().first == baseline, "sleep-time window moves overwrote the baseline")
+        // Feed the real input classifier without typing into or moving the user's desktop.
+        let keyEvent = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)!
+        let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: .zero, mouseButton: .left)!
+        let inputTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
+            recovery.input.record(.keyDown, event: keyEvent)
+            recovery.input.record(.mouseMoved, event: moveEvent)
+        }
+        defer { inputTimer.invalidate() }
+        let wakeAt = Date()
         NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
-        // The user may be active at wake. Schedule the rebound only after the first actual restore.
-        try await until("first wake restoration timeout", seconds: 150) {
+        try await until("typing or pointer movement blocked window restoration", seconds: 8) {
             original.windows.allSatisfy { window in AX.rect(window.element).map { Geometry.close($0, window.globalFrame) } ?? false }
         }
+        try require(!recovery.input.idle, "test did not sustain input through restoration")
+        print("PASS: first window restore in", Date().timeIntervalSince(wakeAt), "seconds despite continuous typing and pointer movement")
         DistributedNotificationCenter.default().postNotificationName(.init("app.dockpin.fixture.rebound"), object: nil, userInfo: nil, deliverImmediately: true)
         try await until("wake restoration timeout", seconds: 150) { recovery.status.contains("복원 완료") }
         let after = await access.scan(apps: apps(), displays: Screens.current())
@@ -67,6 +85,7 @@ import DockpinCore
         let details = (diagnostics["lastRecovery"] as! [String: Any])["windows"] as! [[String: Any]]
         try require(details.contains { ($0["attempts"] as? Int ?? 0) >= 2 }, "late fixture resize was not detected and repaired")
         print("PASS: same-title windows restored, including a second resize 8 seconds after wake; frozen snapshot unchanged")
+        inputTimer.invalidate()
         let deniedDirectory = directory.appendingPathComponent("denied")
         try LayoutRepository(directory: deniedDirectory).save(baseline)
         let denied = Recovery(directory: deniedDirectory, applications: apps, isTrusted: { false })
@@ -78,6 +97,12 @@ import DockpinCore
         _ = await access.move(after.windows[0], to: CGRect(x: 50,y: 50,width: 300,height: 300), permit: permit)
         let unchanged = await access.scan(apps: apps(), displays: screens)
         try require(Geometry.close(unchanged.windows[0].globalFrame, after.windows[0].globalFrame), "cancelled write changed a window")
+        let monitor = InputActivity(), interactionPermit = WritePermit()
+        monitor.onWindowInteraction = { interactionPermit.cancel() }
+        monitor.record(.keyDown, event: keyEvent); monitor.record(.mouseMoved, event: moveEvent)
+        try require(!interactionPermit.cancelled, "ordinary input cancelled a window write")
+        monitor.record(.leftMouseDown, event: moveEvent)
+        try require(interactionPermit.cancelled, "mouse interaction did not cancel a window write")
         recovery.stop()
         // A failed Dock must not suspend healthy window capture.
         let partialDirectory = directory.appendingPathComponent("partial")
@@ -99,6 +124,7 @@ import DockpinCore
         }
         print("PASS: Dock failure protects only Dock settings; healthy window geometry continues saving")
         partial.stop()
+        if CommandLine.arguments.contains("--windows-only") { return }
         let dock = DockAccess(), input = InputActivity()
         input.start()
         try await until("input monitor unavailable or user is active") { input.idle }

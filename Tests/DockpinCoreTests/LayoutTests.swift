@@ -26,7 +26,34 @@ func XCTAssertNil<T>(_ value: T?, file: StaticString = #file, line: UInt = #line
         suite.testOnlyAgentBoardMainPanelIsIncluded()
         suite.testFailureProtectionKeepsHealthyWindowsFresh()
         suite.testProtectionDoesNotLeakAcrossDisplaysOrAmbiguousWindows()
-        print("PASS: 12 recovery, geometry, identity and persistence scenarios")
+        suite.testContinuousTypingAndMovementDoNotDelayWindows()
+        suite.testClicksDragsAndMissingMonitorStillBlockWrites()
+        print("PASS: 14 recovery, geometry, identity, persistence and input scenarios")
+    }
+    func testContinuousTypingAndMovementDoNotDelayWindows() {
+        var input = InputReadiness()
+        let start = Date()
+        for offset in 0..<600 {
+            let now = start.addingTimeInterval(Double(offset) / 10)
+            XCTAssertFalse(input.record(offset % 2 == 0 ? .typing : .movement, at: now))
+            XCTAssertTrue(input.windowsReady(at: now, available: true, buttonsDown: false))
+            XCTAssertFalse(input.dockReady(at: now, available: true, buttonsDown: false))
+        }
+        XCTAssertFalse(input.record(.scrolling, at: start.addingTimeInterval(60)))
+        XCTAssertTrue(input.windowsReady(at: start.addingTimeInterval(60), available: true, buttonsDown: false))
+        XCTAssertTrue(input.dockReady(at: start.addingTimeInterval(62), available: true, buttonsDown: false))
+    }
+    func testClicksDragsAndMissingMonitorStillBlockWrites() {
+        var input = InputReadiness()
+        let now = Date()
+        XCTAssertTrue(input.record(.dragging, at: now))
+        XCTAssertEqual(input.lastDrag, now)
+        XCTAssertFalse(input.windowsReady(at: now.addingTimeInterval(0.249), available: true, buttonsDown: false))
+        XCTAssertTrue(input.windowsReady(at: now.addingTimeInterval(0.251), available: true, buttonsDown: false))
+        XCTAssertFalse(input.windowsReady(at: now.addingTimeInterval(10), available: true, buttonsDown: true))
+        XCTAssertFalse(input.windowsReady(at: now.addingTimeInterval(10), available: false, buttonsDown: false))
+        XCTAssertTrue(input.record(.pointerInteraction, at: now.addingTimeInterval(11)))
+        XCTAssertFalse(input.windowsReady(at: now.addingTimeInterval(11.1), available: true, buttonsDown: false))
     }
     func screen(_ id: String, _ x: Double = 0, _ y: Double = 0, _ width: Double = 2560, _ height: Double = 1440) -> DisplaySnapshot {
         let r = CGRect(x: x, y: y, width: width, height: height)

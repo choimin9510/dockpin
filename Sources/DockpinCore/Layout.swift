@@ -141,6 +141,27 @@ public struct LayoutProtection {
     }
 }
 
+public struct InputReadiness {
+    public enum Kind { case typing, movement, scrolling, pointerInteraction, dragging }
+    public private(set) var lastInput = Date.distantPast
+    public private(set) var lastPointerInteraction = Date.distantPast
+    public private(set) var lastDrag = Date.distantPast
+    public init() {}
+    @discardableResult public mutating func record(_ kind: Kind, at now: Date) -> Bool {
+        lastInput = now
+        let interruptsWindow = kind == .pointerInteraction || kind == .dragging
+        if interruptsWindow { lastPointerInteraction = now }
+        if kind == .dragging { lastDrag = now }
+        return interruptsWindow
+    }
+    public func windowsReady(at now: Date, available: Bool, buttonsDown: Bool) -> Bool {
+        available && !buttonsDown && now.timeIntervalSince(lastPointerInteraction) >= 0.25
+    }
+    public func dockReady(at now: Date, available: Bool, buttonsDown: Bool) -> Bool {
+        available && !buttonsDown && now.timeIntervalSince(lastInput) >= 2
+    }
+}
+
 public struct RecoveryGate {
     public enum Phase: String { case tracking, sleeping, settling, restoring }
     public private(set) var phase: Phase = .tracking

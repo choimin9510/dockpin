@@ -38,6 +38,8 @@ final class Recovery: ObservableObject {
     private var restoreTask: Task<Void, Never>?
     private var changedByUser: Set<String> = []
     private var restoreStarted = Date.distantFuture
+    private var requestedAt: Date?
+    private var waitReason = ""
     private var lastDisplayState: [DisplaySnapshot] = []
     private var dockSettings: DockSnapshot?
     private var settingsReadAt = Date.distantPast
@@ -58,7 +60,7 @@ final class Recovery: ObservableObject {
         catch { status = "저장된 배치를 읽지 못했어요: \(error.localizedDescription)" }
     }
     func start(rememberCurrent: Bool = false) {
-        input.onInput = { [weak self] in self?.currentWrite?.cancel() }
+        input.onWindowInteraction = { [weak self] in self?.currentWrite?.cancel() }
         lastDisplayState = Screens.current()
         pending = profiles[Geometry.configurationID(lastDisplayState)] ?? profiles.values.max(by: { $0.savedAt < $1.savedAt })
         savedAt = pending?.savedAt; windowCount = pending?.windows.count ?? 0
@@ -122,13 +124,17 @@ final class Recovery: ObservableObject {
     }
     func wake() {
         guard enabled else { return }
+        if gate.phase == .tracking || gate.phase == .sleeping || requestedAt == nil { requestedAt = Date() }
         freeze(); gate.wake(now: Date()); restoreStarted = Date(); changedByUser.removeAll()
+        waitReason = "displaySettling"
         status = "화면이 다시 연결되기를 기다리는 중"
         writeDiagnostics()
     }
     private func displayChanged() {
         guard enabled else { return }
+        if gate.phase == .tracking || requestedAt == nil { requestedAt = Date() }
         freeze(); gate.displayChanged(now: Date())
+        waitReason = "displaySettling"
         if gate.phase != .sleeping { status = "화면 구성이 안정되기를 기다리는 중" }
         writeDiagnostics()
     }
@@ -142,7 +148,8 @@ final class Recovery: ObservableObject {
         pending = profiles[Geometry.configurationID(Screens.current())] ?? pending
         guard pending != nil else { status = "먼저 현재 배치를 기억해 주세요"; return }
         closePanel(); freeze(); gate.wake(now: Date()); restoreStarted = Date(); changedByUser.removeAll()
-        status = "입력이 멈추면 저장된 배치로 복원해요"
+        requestedAt = Date(); waitReason = "displaySettling"
+        status = "화면이 안정되면 저장된 배치로 복원해요"
     }
     func rememberNow() {
         guard canRemember else { return }
@@ -179,10 +186,13 @@ final class Recovery: ObservableObject {
             if pending == nil { pending = profiles[key] }
             if let pending = pending {
                 let expected = Set(pending.displays.map(\.id)), actual = Set(screens.map(\.id))
-                if !expected.isSubset(of: actual) && Date() < gate.deadline { return }
+                if !expected.isSubset(of: actual) && Date() < gate.deadline {
+                    waiting("저장된 화면이 다시 연결되기를 기다리는 중", reason: "displayMissing"); return
+                }
             }
-            guard input.idle else {
-                status = input.available ? "입력이 멈추면 복원을 시작해요" : "입력 감지 권한을 확인해 주세요"
+            guard input.windowsReady else {
+                waiting(input.available ? "클릭·드래그가 끝나면 창을 복원해요" : "입력 감지 권한을 확인해 주세요",
+                        reason: input.available ? "pointerInteraction" : "inputMonitorUnavailable")
                 return
             }
             if let target = pending {
@@ -194,16 +204,22 @@ final class Recovery: ObservableObject {
             }
         } else if gate.canCapture && !busy {
             let key = Geometry.configurationID(screens)
-            if Date() >= protectionRetryAt, input.idle, let protection = protections[key], !protection.isEmpty {
+            if Date() >= protectionRetryAt, let protection = protections[key], !protection.isEmpty,
+               protection.windowIDs.isEmpty ? input.idle : input.windowsReady {
                 var target = protection.baseline
                 if !protection.dock { target.dock = nil }
                 freeze(); gate.remember(); gate.begin(); busy = true
                 restoreStarted = Date(); changedByUser.removeAll()
+                requestedAt = Date(); waitReason = "retry"
                 let generation = gate.generation
                 let retryTarget = target
                 restoreTask = Task { @MainActor in await self.restore(retryTarget, generation: generation, retry: true, windowIDs: protection.windowIDs) }
             } else if Date().timeIntervalSince(lastScan) >= 5 { requestCapture() }
         }
+    }
+    private func waiting(_ message: String, reason: String) {
+        guard status != message || waitReason != reason else { return }
+        status = message; waitReason = reason; writeDiagnostics()
     }
     private func requestCapture(force: Bool = false) {
         guard gate.canCapture, !busy, (enabled || force) else { return }
@@ -273,32 +289,17 @@ final class Recovery: ObservableObject {
         let started = Date()
         let observation = retry ? min(3, timing.observation) : timing.observation
         let deadline = started.addingTimeInterval(retry ? min(10, timing.timeout) : timing.timeout)
-        lastRecovery = ["startedAt": started.description, "retry": retry, "windows": [[String: Any]]()]
+        lastRecovery = ["startedAt": started.description, "retry": retry, "windows": [[String: Any]](),
+                        "requestedAt": requestedAt?.description ?? "",
+                        "startDelaySeconds": started.timeIntervalSince(requestedAt ?? started),
+                        "waitReasonBeforeStart": waitReason]
+        waitReason = ""
         status = "저장된 배치로 복원하고 앱의 크기 변경을 확인하는 중"
         writeDiagnostics()
-        var dockOK = true
+        var dockOK = snapshot.dock == nil
         var dockReason = ""
-        if let savedDock = snapshot.dock {
-            let screens = Screens.current()
-            let bottom = (UserDefaults(suiteName: "com.apple.dock")?.string(forKey: "orientation") ?? "bottom") == "bottom"
-            if dockConflict() { dockOK = false; dockReason = "DockLock 실행 중" }
-            else if !bottom { dockOK = false; dockReason = "Dock 아래쪽 설정 필요" }
-            else if let screen = screens.first(where: { $0.id == savedDock.displayID }) {
-                dockOK = false
-                for _ in 0..<3 {
-                    guard !cancelled() else { return }
-                    if await dock.relocate(to: screen, displays: screens, input: input, cancelled: cancelled) { dockOK = true; break }
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                }
-                guard !cancelled() else { return }
-                if input.idle {
-                    let sizeOK = await dock.applySettings(savedDock, cancelled: cancelled)
-                    dockOK = sizeOK && dockOK
-                    if !sizeOK { dockReason = "Dock 크기 복원 또는 자동화 권한 확인 필요" }
-                } else { dockOK = false }
-            } else { dockOK = false; dockReason = "Dock 대상 화면 미연결" }
-        }
-        guard !cancelled() else { return }
+        var dockChecked = false
+        var firstWrites: [String: Date] = [:]
         var restored: Set<String> = [], skipped: Set<String> = [], failed: Set<String> = []
         var attempts: [String: Int] = [:]
         var stableSince = Date()
@@ -313,7 +314,10 @@ final class Recovery: ObservableObject {
             for saved in snapshot.windows where windowIDs == nil || windowIDs!.contains(saved.id) {
                 guard !cancelled() else { return }
                 var detail: [String: Any] = ["id": saved.id, "bundleID": saved.bundleID, "attempts": attempts[saved.id, default: 0]]
-                defer { details.append(detail) }
+                defer {
+                    if let date = firstWrites[saved.id] { detail["firstWriteAt"] = date.description }
+                    details.append(detail)
+                }
                 guard let currentScreen = screens.first(where: { $0.id == saved.displayID }),
                       let oldScreen = snapshot.displays.first(where: { $0.id == saved.displayID }) else {
                     failed.insert(saved.id); detail["result"] = "displayMissing"; continue
@@ -336,14 +340,22 @@ final class Recovery: ObservableObject {
                 }
                 // Recheck every window, including ones that previously accepted an AX write.
                 failed.insert(saved.id)
-                guard input.idle else { detail["result"] = "waitingForInput"; continue }
+                guard input.windowsReady else { detail["result"] = "waitingForPointerInteraction"; continue }
                 let permit = WritePermit(); currentWrite = permit
                 attempts[saved.id, default: 0] += 1
+                if firstWrites[saved.id] == nil { firstWrites[saved.id] = Date() }
                 let accepted = await access.move(current, to: frame, permit: permit)
                 detail["attempts"] = attempts[saved.id]
                 detail["result"] = accepted ? "writeAcceptedAwaitingVerification" : "writeUnconfirmed"
                 currentWrite = nil
             }
+            // Restore windows first; Dock cursor movement must not hold up window geometry.
+            if !dockChecked {
+                lastRecovery["firstWindowPassAt"] = Date().description
+                let result = await restoreDock(snapshot.dock, cancelled: cancelled)
+                dockOK = result.ok; dockReason = result.reason; dockChecked = true
+            }
+            guard !cancelled() else { return }
             if !failed.isEmpty { stableSince = Date() }
             lastRecovery["windows"] = details
             lastRecovery["dockResult"] = dockOK ? "verified" : dockReason
@@ -370,12 +382,35 @@ final class Recovery: ObservableObject {
         lastRecovery["success"] = success
         lastScan = Date(); writeDiagnostics()
     }
+    private func restoreDock(_ saved: DockSnapshot?, cancelled: () -> Bool) async -> (ok: Bool, reason: String) {
+        guard let saved else { return (true, "") }
+        guard !cancelled() else { return (false, "취소됨") }
+        let screens = Screens.current()
+        let bottom = (UserDefaults(suiteName: "com.apple.dock")?.string(forKey: "orientation") ?? "bottom") == "bottom"
+        if dockConflict() { return (false, "DockLock 실행 중") }
+        if !bottom { return (false, "Dock 아래쪽 설정 필요") }
+        guard let screen = screens.first(where: { $0.id == saved.displayID }) else { return (false, "Dock 대상 화면 미연결") }
+        var positionOK = dock.currentDisplay(screens) == saved.displayID
+        for _ in 0..<3 where !positionOK {
+            guard !cancelled(), input.idle else { break }
+            positionOK = await dock.relocate(to: screen, displays: screens, input: input, cancelled: cancelled)
+            if !positionOK { try? await Task.sleep(nanoseconds: 1_000_000_000) }
+        }
+        guard !cancelled() else { return (false, "취소됨") }
+        // Reading unchanged settings is safe while typing; any write still waits for idle input.
+        let sizeOK = await dock.applySettings(saved, cancelled: { cancelled() || !self.input.idle })
+        if positionOK && sizeOK { return (true, "") }
+        if !input.idle { return (false, "Dock 복원은 입력이 멈추면 다시 시도해요") }
+        return (false, sizeOK ? "Dock 이동 실패" : "Dock 크기 복원 또는 자동화 권한 확인 필요")
+    }
     private func rectDescription(_ frame: CGRect) -> [String: Double] {
         ["x": frame.minX, "y": frame.minY, "width": frame.width, "height": frame.height]
     }
     private func writeDiagnostics() {
         let key = Geometry.configurationID(Screens.current())
         let payload: [String: Any] = ["updatedAt": Date().description, "enabled": enabled, "phase": gate.phase.rawValue,
+                                     "requestedAt": requestedAt?.description ?? "", "waitReason": waitReason,
+                                     "inputMonitorAvailable": input.available, "windowsReady": input.windowsReady, "dockInputIdle": input.idle,
                                      "windowCount": windowCount, "status": status, "automationAllowed": automationAllowed,
                                      "automationStatus": dock.permissionStatus, "savedAt": savedAt?.description ?? "",
                                      "protectedWindowIDs": Array(protections[key]?.windowIDs ?? []).sorted(),

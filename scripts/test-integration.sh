@@ -18,4 +18,4 @@ PLIST
 codesign --force --sign - "$FIXTURE"
 xcrun swiftc -parse-as-library -I .build/native Sources/Dockpin/Platform.swift Sources/Dockpin/Recovery.swift \
   Tests/Integration/Runner.swift .build/native/DockpinCore.o -o .build/native/DockpinIntegration
-.build/native/DockpinIntegration
+.build/native/DockpinIntegration "$@"
